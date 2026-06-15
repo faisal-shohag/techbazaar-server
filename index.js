@@ -1,10 +1,11 @@
-const dns = require('node:dns');
-dns.setServers(['1.1.1.1', '1.0.0.1']); 
+const dns = require("node:dns");
+dns.setServers(["1.1.1.1", "1.0.0.1"]);
 
 const express = require("express");
 const dontenv = require("dotenv");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
 dontenv.config();
 
 const uri = process.env.MONGODB_URI;
@@ -28,12 +29,121 @@ const client = new MongoClient(uri, {
   },
 });
 
+const JWKS = createRemoteJWKSet(
+  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
+);
+
+const verifyToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer")) {
+    return res.status(401).json({ msg: "Unauthorized" });
+  }
+
+  // ["Bearer", "xjasasdhsagdydsav"]
+
+  const token = authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({ msg: "Unauthorized" });
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+    req.user = payload;
+
+    next();
+  } catch (error) {
+    console.log(error);
+    return res.status(401).json({ msg: "Unauthorized" });
+  }
+};
+
+const sellerVerify = async (req, res, next) => {
+  const user = req.user;
+  if (user.role !== "seller" || user.plan != "pro") {
+    return res.status(403).json({ msg: "Forbidden" });
+  }
+  next();
+};
+
 async function run() {
   try {
     await client.connect();
-    const db = client.db("tech-bazaar2");
+    const db = client.db("tech-bazaar");
+    const subscriptionsCollection = db.collection("subscriptions");
+    const userCollection = db.collection("user");
+    const productCollection = db.collection("products");
 
- 
+    app.post("/subscription", async (req, res) => {
+      const { sessionId, userId, priceId } = req.body;
+
+      const isExist = await subscriptionsCollection.findOne({ sessionId });
+      if (isExist) {
+        return res.json({ msg: "Already exist!" });
+      }
+
+      await subscriptionsCollection.insertOne({
+        sessionId,
+        userId,
+        priceId,
+      });
+
+      //update user role
+      await userCollection.updateOne(
+        { _id: new ObjectId(userId) },
+        { $set: { plan: "pro" } },
+      );
+
+      res.json({ msg: "Payment successfull!" });
+    });
+
+    app.post(
+      "/seller/products",
+      verifyToken,
+      sellerVerify,
+      async (req, res) => {
+        const data = req.body;
+        const result = await productCollection.insertOne({
+          ...data,
+          userId: req.user.id,
+        });
+
+        res.send(result);
+      },
+    );
+
+    app.get("/seller/products", verifyToken, sellerVerify, async (req, res) => {
+      const { page = 1, limit = 10 } = req.query;
+      const skip = (Number(page) - 1) * Number(limit);
+
+      const result = await productCollection
+        .find({ userId: req.user.id })
+        .skip(skip)
+        .limit(Number(limit))
+        .toArray();
+      const totalData = await productCollection.countDocuments({
+        userId: req.user.id,
+      });
+      const totalPage = Math.ceil(totalData / Number(limit));
+
+      res.send({ data: result, page: Number(page), totalPage });
+    });
+
+    app.get("/products", async (req, res) => {
+      const { search } = req.query;
+      const query = {};
+      if (search && search != "undefined") {
+        query.$or = [
+          { title: { $regex: search, $options: "i" } },
+          { description: { $regex: search, $options: "i" } },
+        ];
+      }
+
+      const result = await productCollection.find(query).toArray();
+
+      res.send(result);
+    });
 
     await client.db("admin").command({ ping: 1 });
     console.log(
